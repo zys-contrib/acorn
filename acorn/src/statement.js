@@ -4,7 +4,7 @@ import {lineBreak, skipWhiteSpace} from "./whitespace.js"
 import {isIdentifierStart, isIdentifierChar, keywordRelationalOperator} from "./identifier.js"
 import {hasOwn, loneSurrogate} from "./util.js"
 import {DestructuringErrors} from "./parseutil.js"
-import {functionFlags, SCOPE_SIMPLE_CATCH, BIND_SIMPLE_CATCH, BIND_LEXICAL, BIND_VAR, BIND_FUNCTION, SCOPE_CLASS_STATIC_BLOCK, SCOPE_SUPER, SCOPE_CLASS_FIELD_INIT} from "./scopeflags.js"
+import {functionFlags, SCOPE_SIMPLE_CATCH, BIND_SIMPLE_CATCH, BIND_LEXICAL, BIND_VAR, BIND_FUNCTION, SCOPE_CLASS_STATIC_BLOCK, SCOPE_SUPER, SCOPE_CLASS_FIELD_INIT, SCOPE_SWITCH} from "./scopeflags.js"
 
 const pp = Parser.prototype
 
@@ -27,7 +27,7 @@ pp.parseTopLevel = function(node) {
       this.raiseRecoverable(this.undefinedExports[name].start, `Export '${name}' is not defined`)
   this.adaptDirectivePrologue(node.body)
   this.next()
-  node.sourceType = this.options.sourceType
+  node.sourceType = this.options.sourceType === "commonjs" ? "script" : this.options.sourceType
   return this.finishNode(node, "Program")
 }
 
@@ -37,7 +37,7 @@ pp.isLet = function(context) {
   if (this.options.ecmaVersion < 6 || !this.isContextual("let")) return false
   skipWhiteSpace.lastIndex = this.pos
   let skip = skipWhiteSpace.exec(this.input)
-  let next = this.pos + skip[0].length, nextCh = this.input.charCodeAt(next)
+  let next = this.pos + skip[0].length, nextCh = this.fullCharCodeAt(next)
   // For ambiguous cases, determine if a LexicalDeclaration (or only a
   // Statement) is allowed here. If context is not empty then only a Statement
   // is allowed. However, `let [` is an explicit negative lookahead for
@@ -45,12 +45,13 @@ pp.isLet = function(context) {
   if (nextCh === 91 || nextCh === 92) return true // '[', '\'
   if (context) return false
 
-  if (nextCh === 123 || nextCh > 0xd7ff && nextCh < 0xdc00) return true // '{', astral
+  if (nextCh === 123) return true // '{'
   if (isIdentifierStart(nextCh, true)) {
-    let pos = next + 1
-    while (isIdentifierChar(nextCh = this.input.charCodeAt(pos), true)) ++pos
-    if (nextCh === 92 || nextCh > 0xd7ff && nextCh < 0xdc00) return true
-    let ident = this.input.slice(next, pos)
+    let start = next
+    do { next += nextCh <= 0xffff ? 1 : 2 }
+    while (isIdentifierChar(nextCh = this.fullCharCodeAt(next), true))
+    if (nextCh === 92) return true
+    let ident = this.input.slice(start, next)
     if (!keywordRelationalOperator.test(ident)) return true
   }
   return false
@@ -92,19 +93,19 @@ pp.isUsingKeyword = function(isAwaitUsing, isFor) {
 
     skipWhiteSpace.lastIndex = awaitEndPos
     let skipAfterUsing = skipWhiteSpace.exec(this.input)
-    if (skipAfterUsing && lineBreak.test(this.input.slice(awaitEndPos, awaitEndPos + skipAfterUsing[0].length))) return false
+    next = awaitEndPos + skipAfterUsing[0].length
+    if (skipAfterUsing && lineBreak.test(this.input.slice(awaitEndPos, next))) return false
   }
 
-  if (isFor) {
-    let ofEndPos = next + 2 /* of */, after
-    if (this.input.slice(next, ofEndPos) === "of") {
-      if (ofEndPos === this.input.length ||
-        (!isIdentifierChar(after = this.input.charCodeAt(ofEndPos)) && !(after > 0xd7ff && after < 0xdc00))) return false
-    }
-  }
-
-  let ch = this.input.charCodeAt(next)
-  return isIdentifierStart(ch, true) || ch === 92 // '\'
+  let ch = this.fullCharCodeAt(next)
+  if (!isIdentifierStart(ch, true) && ch !== 92 /* '\' */) return false
+  let idStart = next
+  do { next += ch <= 0xffff ? 1 : 2 }
+  while (isIdentifierChar(ch = this.fullCharCodeAt(next)))
+  if (ch === 92) return true
+  let id = this.input.slice(idStart, next)
+  if (keywordRelationalOperator.test(id) || isFor && id === "of") return false
+  return true
 }
 
 pp.isAwaitUsing = function(isFor) {
@@ -193,8 +194,8 @@ pp.parseStatement = function(context, topLevel, exports) {
 
     let usingKind = this.isAwaitUsing(false) ? "await using" : this.isUsing(false) ? "using" : null
     if (usingKind) {
-      if (topLevel && this.options.sourceType === "script") {
-        this.raise(this.start, "Using declaration cannot appear in the top level when source type is `script`")
+      if (!this.allowUsing) {
+        this.raise(this.start, "Using declaration cannot appear in the top level when source type is `script` or in the bare case statement")
       }
       if (usingKind === "await using") {
         if (!this.canAwait) {
@@ -291,7 +292,12 @@ pp.parseForStatement = function(node) {
   if (usingKind) {
     let init = this.startNode()
     this.next()
-    if (usingKind === "await using") this.next()
+    if (usingKind === "await using") {
+      if (!this.canAwait) {
+        this.raise(this.start, "Await using cannot appear outside of async function")
+      }
+      this.next()
+    }
     this.parseVar(init, true, usingKind)
     this.finishNode(init, "VariableDeclaration")
     return this.parseForAfterInit(node, init, awaitAt)
@@ -350,7 +356,7 @@ pp.parseIfStatement = function(node) {
 }
 
 pp.parseReturnStatement = function(node) {
-  if (!this.inFunction && !this.options.allowReturnOutsideFunction)
+  if (!this.allowReturn)
     this.raise(this.start, "'return' outside of function")
   this.next()
 
@@ -369,7 +375,7 @@ pp.parseSwitchStatement = function(node) {
   node.cases = []
   this.expect(tt.braceL)
   this.labels.push(switchLabel)
-  this.enterScope(0)
+  this.enterScope(SCOPE_SWITCH)
 
   // Statements under must be grouped (by label) in SwitchCase
   // nodes. `cur` is used to keep the node that we are currently
