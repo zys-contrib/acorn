@@ -5,7 +5,7 @@ import {getOptions} from "./options.js"
 import {wordsRegexp} from "./util.js"
 import {
   SCOPE_TOP, SCOPE_FUNCTION, SCOPE_ASYNC, SCOPE_GENERATOR, SCOPE_SUPER, SCOPE_DIRECT_SUPER,
-  SCOPE_ARROW, SCOPE_CLASS_STATIC_BLOCK, SCOPE_CLASS_FIELD_INIT
+  SCOPE_ARROW, SCOPE_CLASS_STATIC_BLOCK, SCOPE_CLASS_FIELD_INIT, SCOPE_SWITCH
 } from "./scopeflags.js"
 
 export class Parser {
@@ -83,7 +83,12 @@ export class Parser {
 
     // Scope tracking for duplicate variable names (see scope.js)
     this.scopeStack = []
-    this.enterScope(SCOPE_TOP)
+    this.enterScope(
+      this.options.sourceType === "commonjs"
+        // In commonjs, the top-level scope behaves like a function scope
+        ? SCOPE_FUNCTION
+        : SCOPE_TOP
+    )
 
     // For RegExp validation
     this.regexpState = null
@@ -115,6 +120,12 @@ export class Parser {
     return (this.inModule && this.options.ecmaVersion >= 13) || this.options.allowAwaitOutsideFunction
   }
 
+  get allowReturn() {
+    if (this.inFunction) return true
+    if (this.options.allowReturnOutsideFunction && this.currentVarScope().flags & SCOPE_TOP) return true
+    return false
+  }
+
   get allowSuper() {
     const {flags} = this.currentThisScope()
     return (flags & SCOPE_SUPER) > 0 || this.options.allowSuperOutsideMethod
@@ -131,6 +142,13 @@ export class Parser {
           ((flags & SCOPE_FUNCTION) && !(flags & SCOPE_ARROW))) return true
     }
     return false
+  }
+
+  get allowUsing() {
+    const {flags} = this.currentScope()
+    if (flags & SCOPE_SWITCH) return false
+    if (!this.inModule && flags & SCOPE_TOP) return false
+    return true
   }
 
   get inClassStaticBlock() {
